@@ -355,10 +355,20 @@ pub struct SiwsVerifyRequest {
 pub struct SiwsVerifyResponse {
     pub access_token: String,
     pub refresh_token: String,
+    #[serde(default = "default_token_type")]
     pub token_type: String,
+    #[serde(default = "default_expires_in")]
     pub expires_in: i64,
     #[serde(default)]
     pub csrf_token: Option<String>,
+}
+
+fn default_token_type() -> String {
+    "Bearer".to_string()
+}
+
+fn default_expires_in() -> i64 {
+    900 // 15 minutes
 }
 
 // --- S3 key management types ---
@@ -378,9 +388,11 @@ pub struct S3KeyInfo {
     pub key_name: String,
     pub access_key_id: String,
     pub bucket_id: String,
+    #[serde(default)]
+    pub bucket_name: Option<String>,
     pub name_prefix: String,
     #[serde(default)]
-    pub capabilities: Vec<String>,
+    pub capabilities: String,
     pub created_at: String,
 }
 
