@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
+use std::io::IsTerminal;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 
@@ -1525,7 +1526,7 @@ pub async fn run_cli() -> Result<()> {
             );
 
             let mut tx_sig = tx_sig.map(|s| extract_solana_tx_sig(&s)).filter(|s| !s.is_empty());
-            if tx_sig.is_none() && !no_prompt && atty::is(atty::Stream::Stdin) {
+            if tx_sig.is_none() && !no_prompt && std::io::stdin().is_terminal() {
                 use std::io::{self, Write};
                 println!();
                 println!("Paste the payment tx signature to finish (or press Enter to skip):");

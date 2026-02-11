@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-atty = "0.2"
 base64 = "0.21"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
