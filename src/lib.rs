@@ -446,8 +446,8 @@ struct UsageBreakdown {
 
 #[derive(Deserialize, Debug)]
 struct UsageTierDetail {
-    #[serde(default)]
-    tier_name: String,
+    #[serde(default, rename = "tier_name")]
+    _tier_name: String,
     #[serde(default)]
     transfer_count: i64,
     #[serde(default)]
@@ -456,8 +456,8 @@ struct UsageTierDetail {
 
 #[derive(Deserialize, Debug)]
 struct UsageTotalBreakdown {
-    #[serde(default)]
-    gb_transferred: f64,
+    #[serde(default, rename = "gb_transferred")]
+    _gb_transferred: f64,
     #[serde(default)]
     usdc_charged: f64,
 }
@@ -474,8 +474,8 @@ struct UsageBreakdownDetail {
 
 #[derive(Deserialize, Debug)]
 struct UsageResponse {
-    #[serde(default)]
-    period: Option<String>,
+    #[serde(default, rename = "period")]
+    _period: Option<String>,
     #[serde(default)]
     breakdown: Option<UsageBreakdownDetail>,
     // Fallback: some server versions return flat (without breakdown wrapper)
