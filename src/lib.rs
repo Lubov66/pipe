@@ -8,6 +8,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
@@ -206,6 +207,18 @@ pub enum Commands {
 
     /// Show S3 endpoint and bucket info
     S3Info,
+
+    /// Show storage and bandwidth usage with free-tier breakdown
+    #[command(alias = "billing")]
+    Usage {
+        /// Time period: 24h, 7d, 30d, 90d, 365d (default: 30d)
+        #[arg(long, default_value = "30d")]
+        period: String,
+
+        /// Show per-tier breakdown
+        #[arg(long)]
+        detailed: bool,
+    },
 
     /// One-command bootstrap: keygen + auth + S3 key creation
     Init {
@@ -414,6 +427,63 @@ pub struct BucketInfoResponse {
     pub public_read: bool,
     #[serde(default)]
     pub cors_allowed_origins: Vec<String>,
+}
+
+// --- Token usage / billing types ---
+
+#[derive(Deserialize, Debug)]
+struct UsageBreakdown {
+    #[serde(default)]
+    gb_transferred: f64,
+    #[serde(default)]
+    usdc_charged: f64,
+    #[serde(default)]
+    transfer_count: i64,
+    #[serde(default)]
+    tier_details: HashMap<String, UsageTierDetail>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UsageTierDetail {
+    #[serde(default)]
+    tier_name: String,
+    #[serde(default)]
+    transfer_count: i64,
+    #[serde(default)]
+    gb_transferred: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct UsageTotalBreakdown {
+    #[serde(default)]
+    gb_transferred: f64,
+    #[serde(default)]
+    usdc_charged: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct UsageBreakdownDetail {
+    #[serde(default)]
+    storage: Option<UsageBreakdown>,
+    #[serde(default)]
+    bandwidth: Option<UsageBreakdown>,
+    #[serde(default)]
+    total: Option<UsageTotalBreakdown>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UsageResponse {
+    #[serde(default)]
+    period: Option<String>,
+    #[serde(default)]
+    breakdown: Option<UsageBreakdownDetail>,
+    // Fallback: some server versions return flat (without breakdown wrapper)
+    #[serde(default)]
+    storage: Option<UsageBreakdown>,
+    #[serde(default)]
+    bandwidth: Option<UsageBreakdown>,
+    #[serde(default)]
+    total: Option<UsageTotalBreakdown>,
 }
 
 fn usdc_raw_to_ui(raw: i64) -> f64 {
@@ -717,6 +787,58 @@ fn print_credits_status(status: &CreditsStatusResponse) {
     }
 }
 
+fn print_usage(usage: &UsageResponse, period: &str, detailed: bool) {
+    println!("Usage for period: {}", period);
+    println!();
+
+    // Resolve breakdown: prefer nested, fall back to flat
+    let storage = usage.breakdown.as_ref().and_then(|b| b.storage.as_ref()).or(usage.storage.as_ref());
+    let bandwidth = usage.breakdown.as_ref().and_then(|b| b.bandwidth.as_ref()).or(usage.bandwidth.as_ref());
+    let total = usage.breakdown.as_ref().and_then(|b| b.total.as_ref()).or(usage.total.as_ref());
+
+    // Storage
+    if let Some(storage) = storage {
+        println!("  Storage:");
+        println!("    Data stored:  {:.4} GB", storage.gb_transferred);
+        println!("    Cost:         ${}", format_usdc_ui(storage.usdc_charged));
+        if storage.usdc_charged == 0.0 && storage.gb_transferred > 0.0 {
+            println!("                  (within free 1 GB tier)");
+        }
+    }
+
+    println!();
+
+    // Bandwidth
+    if let Some(bandwidth) = bandwidth {
+        println!("  Bandwidth (egress):");
+        println!("    Transferred:  {:.4} GB", bandwidth.gb_transferred);
+        println!("    Transfers:    {}", bandwidth.transfer_count);
+        println!("    Cost:         ${}", format_usdc_ui(bandwidth.usdc_charged));
+        if bandwidth.usdc_charged == 0.0 && bandwidth.gb_transferred > 0.0 {
+            println!("                  (within free 100 GB/month tier)");
+        }
+
+        if detailed && !bandwidth.tier_details.is_empty() {
+            println!();
+            println!("    Per-tier breakdown:");
+            println!("    {:<12} {:>10} {:>12}", "Tier", "Transfers", "GB");
+            println!("    {:<12} {:>10} {:>12}", "----", "---------", "----");
+            for (name, tier) in &bandwidth.tier_details {
+                println!(
+                    "    {:<12} {:>10} {:>12.4}",
+                    name, tier.transfer_count, tier.gb_transferred
+                );
+            }
+        }
+    }
+
+    println!();
+
+    // Total
+    if let Some(total) = total {
+        println!("  Total cost:     ${}", format_usdc_ui(total.usdc_charged));
+    }
+}
 
 pub fn get_credentials_file_path(custom_path: Option<&str>) -> PathBuf {
     if let Some(path) = custom_path {
@@ -1882,6 +2004,30 @@ pub async fn run_cli() -> Result<()> {
             if !bucket.cors_allowed_origins.is_empty() {
                 println!("  CORS Origins: {}", bucket.cors_allowed_origins.join(", "));
             }
+        }
+
+        Commands::Usage { period, detailed } => {
+            let mut creds = load_creds_with_config(config_path)?;
+            ensure_valid_token(&client, base_url, &mut creds, config_path).await?;
+
+            let url = format!(
+                "{}/api/token-usage?period={}&detailed={}",
+                base_url, period, detailed
+            );
+            let mut request = client.get(&url);
+            request = add_auth_headers(request, &creds, false)?;
+
+            let resp = request.send().await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            if !status.is_success() {
+                return Err(anyhow!("Failed to get usage ({}): {}", status, text));
+            }
+
+            let usage: UsageResponse = serde_json::from_str(&text)
+                .map_err(|e| anyhow!("Failed to parse usage: {} — body: {}", e, text))?;
+
+            print_usage(&usage, &period, detailed);
         }
 
         Commands::Init { keypair } => {
