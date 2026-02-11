@@ -221,6 +221,20 @@ pub enum Commands {
         detailed: bool,
     },
 
+    /// Show your account profile
+    #[command(alias = "whoami")]
+    Profile,
+
+    /// Log out and terminate the current session
+    Logout,
+
+    /// List or revoke active sessions
+    Sessions {
+        /// Revoke a session by ID (cannot revoke the current session)
+        #[arg(long)]
+        revoke: Option<String>,
+    },
+
     /// One-command bootstrap: keygen + auth + S3 key creation
     Init {
         /// Path to keypair JSON file (default: ~/.config/pipe-cli/wallet.json)
@@ -485,6 +499,37 @@ struct UsageResponse {
     bandwidth: Option<UsageBreakdown>,
     #[serde(default)]
     total: Option<UsageTotalBreakdown>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UserProfile {
+    user_id: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    wallet_public_key: Option<String>,
+    #[serde(default)]
+    account_state: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct SessionInfo {
+    session_id: String,
+    created_at: String,
+    expires_at: String,
+    #[serde(default)]
+    ip_address: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    is_current: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct SessionsResponse {
+    sessions: Vec<SessionInfo>,
 }
 
 fn usdc_raw_to_ui(raw: i64) -> f64 {
@@ -2031,6 +2076,116 @@ pub async fn run_cli() -> Result<()> {
             print_usage(&usage, &period, detailed);
         }
 
+        Commands::Profile => {
+            let mut creds = load_creds_with_config(config_path)?;
+            ensure_valid_token(&client, base_url, &mut creds, config_path).await?;
+
+            let mut request = client.get(format!("{}/user/me", base_url));
+            request = add_auth_headers(request, &creds, false)?;
+
+            let resp = request.send().await?;
+            let status = resp.status();
+            let text = resp.text().await?;
+            if !status.is_success() {
+                return Err(anyhow!("Failed to get profile ({}): {}", status, text));
+            }
+
+            let profile: UserProfile = serde_json::from_str(&text)
+                .map_err(|e| anyhow!("Failed to parse profile: {} — body: {}", e, text))?;
+
+            println!("Account Profile:");
+            println!("  User ID:    {}", profile.user_id);
+            if let Some(name) = &profile.username {
+                println!("  Username:   {}", name);
+            }
+            if let Some(email) = &profile.email {
+                println!("  Email:      {}", email);
+            }
+            if let Some(wallet) = &profile.wallet_public_key {
+                println!("  Wallet:     {}", wallet);
+            }
+            if let Some(state) = &profile.account_state {
+                println!("  State:      {}", state);
+            }
+        }
+
+        Commands::Logout => {
+            let mut creds = load_creds_with_config(config_path)?;
+            ensure_valid_token(&client, base_url, &mut creds, config_path).await?;
+
+            let mut request = client.post(format!("{}/auth/logout", base_url));
+            request = add_auth_headers(request, &creds, true)?;
+
+            let resp = request.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await?;
+                return Err(anyhow!("Logout failed ({}): {}", status, text));
+            }
+
+            // Clear local tokens
+            creds.auth_tokens = None;
+            save_full_credentials(&creds, config_path)?;
+            println!("Logged out successfully. Local tokens cleared.");
+        }
+
+        Commands::Sessions { revoke } => {
+            let mut creds = load_creds_with_config(config_path)?;
+            ensure_valid_token(&client, base_url, &mut creds, config_path).await?;
+
+            if let Some(session_id) = revoke {
+                // Revoke a session
+                let mut request =
+                    client.delete(format!("{}/auth/sessions/{}", base_url, session_id));
+                request = add_auth_headers(request, &creds, true)?;
+
+                let resp = request.send().await?;
+                let status = resp.status();
+                let text = resp.text().await?;
+                if !status.is_success() {
+                    return Err(anyhow!("Failed to revoke session ({}): {}", status, text));
+                }
+                println!("Session {} revoked.", session_id);
+            } else {
+                // List sessions
+                let mut request = client.get(format!("{}/auth/sessions", base_url));
+                request = add_auth_headers(request, &creds, false)?;
+
+                let resp = request.send().await?;
+                let status = resp.status();
+                let text = resp.text().await?;
+                if !status.is_success() {
+                    return Err(anyhow!("Failed to list sessions ({}): {}", status, text));
+                }
+
+                let sessions_resp: SessionsResponse = serde_json::from_str(&text)
+                    .map_err(|e| anyhow!("Failed to parse sessions: {} — body: {}", e, text))?;
+
+                if sessions_resp.sessions.is_empty() {
+                    println!("No active sessions.");
+                } else {
+                    println!("Active Sessions:");
+                    println!();
+                    for s in &sessions_resp.sessions {
+                        let current = if s.is_current { " (current)" } else { "" };
+                        println!("  Session:    {}{}", s.session_id, current);
+                        println!("  Created:    {}", s.created_at);
+                        println!("  Expires:    {}", s.expires_at);
+                        if let Some(ip) = &s.ip_address {
+                            println!("  IP:         {}", ip);
+                        }
+                        if let Some(ua) = &s.user_agent {
+                            println!("  User-Agent: {}", ua);
+                        }
+                        println!();
+                    }
+                    println!("{} session(s) total.", sessions_resp.sessions.len());
+                    println!();
+                    println!("To revoke a session: pipe sessions --revoke <session_id>");
+                }
+            }
+        }
+
         Commands::Init { keypair } => {
             let keypair_path = match keypair {
                 Some(p) => PathBuf::from(p),
@@ -2493,10 +2648,122 @@ mod usage_response_tests {
 }
 
 #[cfg(test)]
+mod profile_response_tests {
+    use super::*;
+
+    #[test]
+    fn parse_full_profile() {
+        let json = r#"{
+            "user_id": "7c1ff9a9-934a-4c4c-b04b-7aac44cdafb3",
+            "username": "alice",
+            "email": "alice@example.com",
+            "wallet_public_key": "ABcD1234pubkey",
+            "account_state": "active",
+            "user_app_key": "",
+            "fees_exempt": false
+        }"#;
+        let p: UserProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.user_id, "7c1ff9a9-934a-4c4c-b04b-7aac44cdafb3");
+        assert_eq!(p.username.as_deref(), Some("alice"));
+        assert_eq!(p.wallet_public_key.as_deref(), Some("ABcD1234pubkey"));
+        assert_eq!(p.account_state.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn parse_minimal_profile() {
+        let json = r#"{"user_id": "abc"}"#;
+        let p: UserProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.user_id, "abc");
+        assert!(p.username.is_none());
+        assert!(p.email.is_none());
+        assert!(p.wallet_public_key.is_none());
+    }
+}
+
+#[cfg(test)]
+mod sessions_response_tests {
+    use super::*;
+
+    #[test]
+    fn parse_sessions_list() {
+        let json = r#"{
+            "sessions": [
+                {
+                    "session_id": "sess-001",
+                    "created_at": "2026-02-10T12:00:00Z",
+                    "expires_at": "2026-02-17T12:00:00Z",
+                    "ip_address": "1.2.3.4",
+                    "user_agent": "pipe-cli/1.0",
+                    "is_current": true
+                },
+                {
+                    "session_id": "sess-002",
+                    "created_at": "2026-02-09T08:00:00Z",
+                    "expires_at": "2026-02-16T08:00:00Z",
+                    "ip_address": "5.6.7.8",
+                    "user_agent": "curl/8.0",
+                    "is_current": false
+                }
+            ],
+            "count": 2
+        }"#;
+        let resp: SessionsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.sessions.len(), 2);
+        assert!(resp.sessions[0].is_current);
+        assert_eq!(resp.sessions[0].session_id, "sess-001");
+        assert!(!resp.sessions[1].is_current);
+    }
+
+    #[test]
+    fn parse_empty_sessions() {
+        let json = r#"{"sessions": [], "count": 0}"#;
+        let resp: SessionsResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.sessions.is_empty());
+    }
+
+    #[test]
+    fn parse_session_without_optional_fields() {
+        let json = r#"{
+            "sessions": [{
+                "session_id": "s1",
+                "created_at": "2026-02-10T00:00:00Z",
+                "expires_at": "2026-02-17T00:00:00Z"
+            }]
+        }"#;
+        let resp: SessionsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.sessions.len(), 1);
+        assert!(resp.sessions[0].ip_address.is_none());
+        assert!(resp.sessions[0].user_agent.is_none());
+        assert!(!resp.sessions[0].is_current);
+    }
+}
+
+#[cfg(test)]
 mod integration_tests {
     use super::*;
     use wiremock::matchers::{method, path, header_exists};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_test_creds() -> SavedCredentials {
+        let future_expiry = Utc::now() + chrono::Duration::hours(1);
+        SavedCredentials {
+            user_id: "test-user".to_string(),
+            user_app_key: "".to_string(),
+            auth_tokens: Some(AuthTokens {
+                access_token: "valid-token".to_string(),
+                refresh_token: "refresh".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 900,
+                expires_at: Some(future_expiry),
+                csrf_token: None,
+            }),
+            username: None,
+            api_base_url: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_virtual_hosted: None,
+        }
+    }
 
     #[tokio::test]
     async fn siws_full_auth_flow() {
@@ -2825,5 +3092,121 @@ mod integration_tests {
         assert_eq!(keys.keys.len(), 1);
         assert_eq!(keys.keys[0].access_key_id, "AKID1234");
         assert_eq!(keys.keys[0].bucket_name, Some("my-bucket".to_string()));
+    }
+
+    #[tokio::test]
+    async fn profile_returns_account_info() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/user/me"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "abc-123",
+                "username": "testuser",
+                "email": "test@example.com",
+                "wallet_public_key": "SoLaNaPubKey123",
+                "account_state": "active",
+                "fees_exempt": false
+            })))
+            .mount(&server)
+            .await;
+
+        let creds = make_test_creds();
+        let client = Client::new();
+        let mut request = client.get(format!("{}/user/me", server.uri()));
+        request = add_auth_headers(request, &creds, false).unwrap();
+        let resp = request.send().await.unwrap();
+        let profile: UserProfile = resp.json().await.unwrap();
+
+        assert_eq!(profile.user_id, "abc-123");
+        assert_eq!(profile.username.as_deref(), Some("testuser"));
+        assert_eq!(profile.wallet_public_key.as_deref(), Some("SoLaNaPubKey123"));
+    }
+
+    #[tokio::test]
+    async fn logout_clears_session() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/logout"))
+            .and(header_exists("Authorization"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"message": "Logged out successfully"})),
+            )
+            .mount(&server)
+            .await;
+
+        let creds = make_test_creds();
+        let client = Client::new();
+        let mut request = client.post(format!("{}/auth/logout", server.uri()));
+        request = add_auth_headers(request, &creds, true).unwrap();
+        let resp = request.send().await.unwrap();
+
+        assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn sessions_list_and_identify_current() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/auth/sessions"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessions": [
+                    {
+                        "session_id": "sess-current",
+                        "created_at": "2026-02-10T12:00:00Z",
+                        "expires_at": "2026-02-17T12:00:00Z",
+                        "ip_address": "1.2.3.4",
+                        "is_current": true
+                    },
+                    {
+                        "session_id": "sess-old",
+                        "created_at": "2026-02-09T00:00:00Z",
+                        "expires_at": "2026-02-16T00:00:00Z",
+                        "ip_address": "5.6.7.8",
+                        "is_current": false
+                    }
+                ],
+                "count": 2
+            })))
+            .mount(&server)
+            .await;
+
+        let creds = make_test_creds();
+        let client = Client::new();
+        let mut request = client.get(format!("{}/auth/sessions", server.uri()));
+        request = add_auth_headers(request, &creds, false).unwrap();
+        let resp = request.send().await.unwrap();
+        let sessions: SessionsResponse = resp.json().await.unwrap();
+
+        assert_eq!(sessions.sessions.len(), 2);
+        assert!(sessions.sessions[0].is_current);
+        assert_eq!(sessions.sessions[0].session_id, "sess-current");
+        assert!(!sessions.sessions[1].is_current);
+    }
+
+    #[tokio::test]
+    async fn session_revoke_rejects_current() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("DELETE"))
+            .and(path("/auth/sessions/sess-current"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({"error": "Cannot revoke current session. Use logout instead."}),
+            ))
+            .mount(&server)
+            .await;
+
+        let creds = make_test_creds();
+        let client = Client::new();
+        let mut request = client.delete(format!("{}/auth/sessions/sess-current", server.uri()));
+        request = add_auth_headers(request, &creds, true).unwrap();
+        let resp = request.send().await.unwrap();
+
+        assert_eq!(resp.status().as_u16(), 400);
     }
 }
