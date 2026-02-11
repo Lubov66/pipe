@@ -2099,3 +2099,730 @@ pub async fn run_cli() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod usdc_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn parse_whole_number() {
+        assert_eq!(parse_usdc_ui_to_raw("10").unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn parse_with_decimals() {
+        assert_eq!(parse_usdc_ui_to_raw("10.50").unwrap(), 10_500_000);
+        assert_eq!(parse_usdc_ui_to_raw("0.001").unwrap(), 1_000);
+        assert_eq!(parse_usdc_ui_to_raw("0.000001").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_with_dollar_sign() {
+        assert_eq!(parse_usdc_ui_to_raw("$25").unwrap(), 25_000_000);
+        assert_eq!(parse_usdc_ui_to_raw("$1.50").unwrap(), 1_500_000);
+    }
+
+    #[test]
+    fn parse_with_whitespace() {
+        assert_eq!(parse_usdc_ui_to_raw("  10  ").unwrap(), 10_000_000);
+        assert_eq!(parse_usdc_ui_to_raw(" $5.25 ").unwrap(), 5_250_000);
+    }
+
+    #[test]
+    fn parse_trailing_dot() {
+        assert_eq!(parse_usdc_ui_to_raw("10.").unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn parse_zero() {
+        assert_eq!(parse_usdc_ui_to_raw("0").unwrap(), 0);
+        assert_eq!(parse_usdc_ui_to_raw("0.000000").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_max_decimals() {
+        assert_eq!(parse_usdc_ui_to_raw("1.123456").unwrap(), 1_123_456);
+    }
+
+    #[test]
+    fn rejects_too_many_decimals() {
+        assert!(parse_usdc_ui_to_raw("1.1234567").is_err());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(parse_usdc_ui_to_raw("").is_err());
+        assert!(parse_usdc_ui_to_raw("$").is_err());
+    }
+
+    #[test]
+    fn rejects_negative() {
+        assert!(parse_usdc_ui_to_raw("-5").is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric() {
+        assert!(parse_usdc_ui_to_raw("abc").is_err());
+        assert!(parse_usdc_ui_to_raw("10.5x").is_err());
+    }
+
+    #[test]
+    fn rejects_overflow() {
+        assert!(parse_usdc_ui_to_raw("10000000000000").is_err());
+    }
+
+    #[test]
+    fn roundtrip_format_parse() {
+        let raw = 12_345_678i64;
+        let ui = usdc_raw_to_ui(raw);
+        let formatted = format!("{:.6}", ui);
+        let parsed_back = parse_usdc_ui_to_raw(&formatted).unwrap();
+        assert_eq!(parsed_back, raw);
+    }
+}
+
+#[cfg(test)]
+mod jwt_tests {
+    use super::*;
+
+    fn make_jwt(sub: &str) -> String {
+        let header = general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"sub":"{}","exp":9999999999}}"#, sub));
+        format!("{}.{}.fakesig", header, payload)
+    }
+
+    #[test]
+    fn extracts_user_id() {
+        let token = make_jwt("user-abc-123");
+        assert_eq!(extract_user_id_from_jwt(&token).unwrap(), "user-abc-123");
+    }
+
+    #[test]
+    fn extracts_uuid_user_id() {
+        let token = make_jwt("7c1ff9a9-934a-4c4c-b04b-7aac44cdafb3");
+        assert_eq!(
+            extract_user_id_from_jwt(&token).unwrap(),
+            "7c1ff9a9-934a-4c4c-b04b-7aac44cdafb3"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_format() {
+        assert!(extract_user_id_from_jwt("not-a-jwt").is_err());
+        assert!(extract_user_id_from_jwt("a.b").is_err());
+        assert!(extract_user_id_from_jwt("").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_base64_payload() {
+        assert!(extract_user_id_from_jwt("a.!!!.c").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_sub_claim() {
+        let header = general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"HS256"}"#);
+        let payload = general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"exp":9999999999}"#);
+        let token = format!("{}.{}.sig", header, payload);
+        assert!(extract_user_id_from_jwt(&token).is_err());
+    }
+
+    #[test]
+    fn rejects_non_string_sub() {
+        let header = general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"HS256"}"#);
+        let payload = general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"sub":12345}"#);
+        let token = format!("{}.{}.sig", header, payload);
+        assert!(extract_user_id_from_jwt(&token).is_err());
+    }
+}
+
+#[cfg(test)]
+mod token_expiry_tests {
+    use super::*;
+
+    fn make_auth_tokens(expires_at: Option<DateTime<Utc>>) -> AuthTokens {
+        AuthTokens {
+            access_token: "test".to_string(),
+            refresh_token: "test".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 900,
+            expires_at,
+            csrf_token: None,
+        }
+    }
+
+    #[test]
+    fn expired_when_no_expiration() {
+        let tokens = make_auth_tokens(None);
+        assert!(is_token_expired(&tokens));
+    }
+
+    #[test]
+    fn expired_when_in_the_past() {
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let tokens = make_auth_tokens(Some(past));
+        assert!(is_token_expired(&tokens));
+    }
+
+    #[test]
+    fn expired_within_60s_buffer() {
+        let soon = Utc::now() + chrono::Duration::seconds(30);
+        let tokens = make_auth_tokens(Some(soon));
+        assert!(is_token_expired(&tokens));
+    }
+
+    #[test]
+    fn not_expired_well_in_future() {
+        let future = Utc::now() + chrono::Duration::hours(1);
+        let tokens = make_auth_tokens(Some(future));
+        assert!(!is_token_expired(&tokens));
+    }
+
+    #[test]
+    fn boundary_at_exactly_61s() {
+        let boundary = Utc::now() + chrono::Duration::seconds(61);
+        let tokens = make_auth_tokens(Some(boundary));
+        assert!(!is_token_expired(&tokens));
+    }
+}
+
+#[cfg(test)]
+mod keypair_tests {
+    use super::*;
+
+    #[test]
+    fn generate_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-wallet.json");
+
+        let (gen_key, gen_pubkey) = generate_solana_keypair(&path, false).unwrap();
+        assert!(path.exists());
+
+        let (load_key, load_pubkey) = load_solana_keypair(&path).unwrap();
+        assert_eq!(gen_pubkey, load_pubkey);
+        assert_eq!(gen_key.to_bytes(), load_key.to_bytes());
+    }
+
+    #[test]
+    fn generate_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("deep").join("wallet.json");
+        let (_key, pubkey) = generate_solana_keypair(&path, false).unwrap();
+        assert!(path.exists());
+        assert!(!pubkey.is_empty());
+    }
+
+    #[test]
+    fn generate_rejects_existing_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        generate_solana_keypair(&path, false).unwrap();
+        assert!(generate_solana_keypair(&path, false).is_err());
+    }
+
+    #[test]
+    fn generate_overwrites_with_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let (_, pub1) = generate_solana_keypair(&path, false).unwrap();
+        let (_, pub2) = generate_solana_keypair(&path, true).unwrap();
+        assert_ne!(pub1, pub2);
+    }
+
+    #[test]
+    fn load_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        assert!(load_solana_keypair(&path).is_err());
+    }
+
+    #[test]
+    fn load_rejects_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        fs::write(&path, "[1,2,3]").unwrap();
+        assert!(load_solana_keypair(&path).is_err());
+    }
+
+    #[test]
+    fn load_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        fs::write(&path, "not json").unwrap();
+        assert!(load_solana_keypair(&path).is_err());
+    }
+
+    #[test]
+    fn pubkey_is_valid_base58() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let (_, pubkey) = generate_solana_keypair(&path, false).unwrap();
+        assert!(pubkey.len() >= 32 && pubkey.len() <= 44);
+        assert!(bs58::decode(&pubkey).into_vec().is_ok());
+    }
+
+    #[test]
+    fn keypair_can_sign_and_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        let (signing_key, _) = generate_solana_keypair(&path, false).unwrap();
+
+        let message = b"test message for SIWS";
+        let signature = signing_key.sign(message);
+
+        let verifying_key: VerifyingKey = (&signing_key).into();
+        assert!(verifying_key.verify_strict(message, &signature).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod usage_response_tests {
+    use super::*;
+
+    #[test]
+    fn parse_nested_breakdown_format() {
+        let json = r#"{
+            "user_id": "abc",
+            "period": "30d",
+            "breakdown": {
+                "storage": {
+                    "gb_transferred": 0.5,
+                    "usdc_charged": 0.0,
+                    "transfer_count": 10,
+                    "tier_details": {}
+                },
+                "bandwidth": {
+                    "gb_transferred": 50.0,
+                    "usdc_charged": 0.0,
+                    "transfer_count": 200,
+                    "tier_details": {
+                        "Normal": {
+                            "tier_name": "Normal",
+                            "transfer_count": 200,
+                            "gb_transferred": 50.0
+                        }
+                    }
+                },
+                "total": {
+                    "gb_transferred": 50.5,
+                    "usdc_charged": 0.0
+                }
+            }
+        }"#;
+
+        let resp: UsageResponse = serde_json::from_str(json).unwrap();
+        let bd = resp.breakdown.as_ref().unwrap();
+        let storage = bd.storage.as_ref().unwrap();
+        let bandwidth = bd.bandwidth.as_ref().unwrap();
+
+        assert!((storage.gb_transferred - 0.5).abs() < f64::EPSILON);
+        assert_eq!(storage.usdc_charged, 0.0);
+        assert!((bandwidth.gb_transferred - 50.0).abs() < f64::EPSILON);
+        assert_eq!(bandwidth.transfer_count, 200);
+        assert!(bandwidth.tier_details.contains_key("Normal"));
+        assert_eq!(bandwidth.tier_details["Normal"].transfer_count, 200);
+    }
+
+    #[test]
+    fn parse_flat_format_fallback() {
+        let json = r#"{
+            "storage": {
+                "gb_transferred": 1.0,
+                "usdc_charged": 0.025,
+                "transfer_count": 5,
+                "tier_details": {}
+            },
+            "bandwidth": {
+                "gb_transferred": 150.0,
+                "usdc_charged": 0.05,
+                "transfer_count": 300,
+                "tier_details": {}
+            },
+            "total": {
+                "gb_transferred": 151.0,
+                "usdc_charged": 0.075
+            }
+        }"#;
+
+        let resp: UsageResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.breakdown.is_none());
+        let storage = resp.storage.as_ref().unwrap();
+        assert!((storage.gb_transferred - 1.0).abs() < f64::EPSILON);
+        let bandwidth = resp.bandwidth.as_ref().unwrap();
+        assert!((bandwidth.usdc_charged - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_empty_response() {
+        let json = r#"{}"#;
+        let resp: UsageResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.breakdown.is_none());
+        assert!(resp.storage.is_none());
+        assert!(resp.bandwidth.is_none());
+        assert!(resp.total.is_none());
+    }
+
+    #[test]
+    fn parse_zero_usage() {
+        let json = r#"{
+            "user_id": "abc",
+            "period": "30d",
+            "breakdown": {
+                "storage": { "gb_transferred": 0.0, "usdc_charged": 0.0, "transfer_count": 0, "tier_details": {} },
+                "bandwidth": { "gb_transferred": 0.0, "usdc_charged": 0.0, "transfer_count": 0, "tier_details": {} },
+                "total": { "gb_transferred": 0.0, "usdc_charged": 0.0 }
+            }
+        }"#;
+
+        let resp: UsageResponse = serde_json::from_str(json).unwrap();
+        let bd = resp.breakdown.unwrap();
+        assert_eq!(bd.storage.unwrap().transfer_count, 0);
+        assert_eq!(bd.bandwidth.unwrap().transfer_count, 0);
+        assert_eq!(bd.total.unwrap().usdc_charged, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use wiremock::matchers::{method, path, header_exists};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn siws_full_auth_flow() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/siws/challenge"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "nonce": "test-nonce-123",
+                "message": "Sign this message to authenticate"
+            })))
+            .mount(&server)
+            .await;
+
+        let user_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let jwt_payload = general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"sub":"{}","exp":9999999999}}"#, user_id));
+        let fake_jwt = format!(
+            "{}.{}.fakesig",
+            general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#),
+            jwt_payload
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/auth/siws/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": fake_jwt,
+                "refresh_token": "refresh-token-xyz",
+                "token_type": "Bearer",
+                "expires_in": 900,
+                "csrf_token": "csrf-abc"
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kp_path = dir.path().join("wallet.json");
+        let (signing_key, pubkey_b58) = generate_solana_keypair(&kp_path, false).unwrap();
+
+        let client = Client::new();
+        let config_path = dir.path().join("creds.json");
+        let config_str = config_path.to_str().unwrap();
+
+        let creds = siws_authenticate(
+            &client,
+            &server.uri(),
+            &signing_key,
+            &pubkey_b58,
+            Some(config_str),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(creds.user_id, user_id);
+        assert!(creds.auth_tokens.is_some());
+        let tokens = creds.auth_tokens.unwrap();
+        assert!(tokens.access_token.contains("fakesig"));
+        assert_eq!(tokens.csrf_token, Some("csrf-abc".to_string()));
+        assert!(tokens.expires_at.is_some());
+
+        let loaded = load_credentials_from_file(Some(config_str)).unwrap().unwrap();
+        assert_eq!(loaded.user_id, user_id);
+    }
+
+    #[tokio::test]
+    async fn siws_challenge_failure() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/siws/challenge"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal error"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kp_path = dir.path().join("wallet.json");
+        let (signing_key, pubkey_b58) = generate_solana_keypair(&kp_path, false).unwrap();
+        let client = Client::new();
+
+        let result = siws_authenticate(&client, &server.uri(), &signing_key, &pubkey_b58, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("challenge failed"));
+    }
+
+    #[tokio::test]
+    async fn fetch_credits_status_success() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/credits/status"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "balance_usdc_raw": 5_000_000,
+                "balance_usdc": 5.0,
+                "total_deposited_usdc_raw": 10_000_000,
+                "total_spent_usdc_raw": 5_000_000,
+                "last_topup_at": "2026-01-15T10:00:00Z",
+                "quota": {
+                    "tier_estimates": [
+                        {"tier_name": "Normal", "cost_per_gb_usdc": 0.025, "available_gb": 200.0}
+                    ]
+                },
+                "intent": null
+            })))
+            .mount(&server)
+            .await;
+
+        let future_expiry = Utc::now() + chrono::Duration::hours(1);
+        let creds = SavedCredentials {
+            user_id: "test-user".to_string(),
+            user_app_key: "".to_string(),
+            auth_tokens: Some(AuthTokens {
+                access_token: "valid-token".to_string(),
+                refresh_token: "refresh".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 900,
+                expires_at: Some(future_expiry),
+                csrf_token: None,
+            }),
+            username: None,
+            api_base_url: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_virtual_hosted: None,
+        };
+
+        let client = Client::new();
+        let status = fetch_credits_status(&client, &server.uri(), &creds).await.unwrap();
+
+        assert_eq!(status.balance_usdc_raw, 5_000_000);
+        assert!((status.balance_usdc - 5.0).abs() < f64::EPSILON);
+        assert_eq!(status.total_deposited_usdc_raw, 10_000_000);
+        assert_eq!(status.quota.tier_estimates.len(), 1);
+        assert_eq!(status.quota.tier_estimates[0].tier_name, "Normal");
+        assert!(status.intent.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_credits_falls_back_to_deposit_balance() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/credits/status"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/deposit/balance"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "balance_usdc_raw": 1_000_000,
+                "balance_usdc": 1.0,
+                "total_deposited_usdc_raw": 1_000_000,
+                "total_spent_usdc_raw": 0,
+                "quota": { "tier_estimates": [] },
+                "intent": null
+            })))
+            .mount(&server)
+            .await;
+
+        let future_expiry = Utc::now() + chrono::Duration::hours(1);
+        let creds = SavedCredentials {
+            user_id: "test".to_string(),
+            user_app_key: "".to_string(),
+            auth_tokens: Some(AuthTokens {
+                access_token: "tok".to_string(),
+                refresh_token: "ref".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 900,
+                expires_at: Some(future_expiry),
+                csrf_token: None,
+            }),
+            username: None,
+            api_base_url: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_virtual_hosted: None,
+        };
+
+        let client = Client::new();
+        let status = fetch_credits_status(&client, &server.uri(), &creds).await.unwrap();
+        assert_eq!(status.balance_usdc_raw, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn token_refresh_flow() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access-token",
+                "token_type": "Bearer",
+                "expires_in": 900,
+                "csrf_token": "new-csrf"
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("creds.json");
+        let config_str = config_path.to_str().unwrap();
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let mut creds = SavedCredentials {
+            user_id: "test".to_string(),
+            user_app_key: "".to_string(),
+            auth_tokens: Some(AuthTokens {
+                access_token: "old-token".to_string(),
+                refresh_token: "valid-refresh".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 900,
+                expires_at: Some(past),
+                csrf_token: None,
+            }),
+            username: None,
+            api_base_url: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_virtual_hosted: None,
+        };
+        save_full_credentials(&creds, Some(config_str)).unwrap();
+
+        let client = Client::new();
+        ensure_valid_token(&client, &server.uri(), &mut creds, Some(config_str))
+            .await
+            .unwrap();
+
+        let tokens = creds.auth_tokens.as_ref().unwrap();
+        assert_eq!(tokens.access_token, "new-access-token");
+        assert_eq!(tokens.csrf_token, Some("new-csrf".to_string()));
+        assert!(tokens.expires_at.unwrap() > Utc::now());
+
+        let loaded = load_credentials_from_file(Some(config_str)).unwrap().unwrap();
+        assert_eq!(loaded.auth_tokens.unwrap().access_token, "new-access-token");
+    }
+
+    #[tokio::test]
+    async fn token_refresh_failure_clears_tokens() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("creds.json");
+        let config_str = config_path.to_str().unwrap();
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let mut creds = SavedCredentials {
+            user_id: "test".to_string(),
+            user_app_key: "".to_string(),
+            auth_tokens: Some(AuthTokens {
+                access_token: "expired".to_string(),
+                refresh_token: "bad-refresh".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 900,
+                expires_at: Some(past),
+                csrf_token: None,
+            }),
+            username: None,
+            api_base_url: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_virtual_hosted: None,
+        };
+        save_full_credentials(&creds, Some(config_str)).unwrap();
+
+        let client = Client::new();
+        let result = ensure_valid_token(&client, &server.uri(), &mut creds, Some(config_str)).await;
+        assert!(result.is_err());
+        assert!(creds.auth_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn s3_key_list_success() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/s3/keys"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [
+                    {
+                        "key_name": "key1",
+                        "access_key_id": "AKID1234",
+                        "bucket_id": "bucket-123",
+                        "bucket_name": "my-bucket",
+                        "name_prefix": "users/test/",
+                        "capabilities": "readWrite",
+                        "created_at": "2026-01-01T00:00:00Z"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let future_expiry = Utc::now() + chrono::Duration::hours(1);
+        let creds = SavedCredentials {
+            user_id: "test".to_string(),
+            user_app_key: "".to_string(),
+            auth_tokens: Some(AuthTokens {
+                access_token: "tok".to_string(),
+                refresh_token: "ref".to_string(),
+                token_type: "Bearer".to_string(),
+                expires_in: 900,
+                expires_at: Some(future_expiry),
+                csrf_token: None,
+            }),
+            username: None,
+            api_base_url: None,
+            s3_endpoint: None,
+            s3_region: None,
+            s3_virtual_hosted: None,
+        };
+
+        let client = Client::new();
+        let mut request = client.get(format!("{}/api/s3/keys", server.uri()));
+        request = add_auth_headers(request, &creds, false).unwrap();
+        let resp = request.send().await.unwrap();
+        let keys: S3KeyListResponse = resp.json().await.unwrap();
+
+        assert_eq!(keys.keys.len(), 1);
+        assert_eq!(keys.keys[0].access_key_id, "AKID1234");
+        assert_eq!(keys.keys[0].bucket_name, Some("my-bucket".to_string()));
+    }
+}
